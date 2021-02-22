@@ -4,10 +4,15 @@
 #include <stdlib.h>
 #include <wiringPi.h>
 #include <stdint.h>
-#include <pthread.h>
 
 #define BUTTON_PIN 1
 #define TEXT_BUFFER_LEN 1024
+#define TEXT_LOCK 0
+#define BIT_BUF_LOCK 1
+
+#define STATE_NONE 0
+#define STATE_WAITING_CONF 1
+#define STATE_WAITING_FRAME 2
 
 volatile uint32_t lastHigh = 0;
 volatile uint32_t lastLow = 0;
@@ -18,12 +23,11 @@ volatile int bufferPos;
 volatile int frameNo = 0;
 volatile int framePos = 0;
 
+// some basic state vars
 volatile char inSeq = 0;
 
 char txtBuf[TEXT_BUFFER_LEN];
 volatile int txtBufPos = 0;
-
-pthread_mutex_t lock, bitlock;
 
 void reset() {
   //  fprintf(stderr, "reset\n");
@@ -36,7 +40,7 @@ void reset() {
 void writeSharedBuf(char* out) {
   int delta;
 
-  pthread_mutex_lock(&lock);
+  piLock(TEXT_LOCK);
   if (strlen(out) + txtBufPos > TEXT_BUFFER_LEN) {
     printf(txtBuf);
     txtBufPos = 0;
@@ -48,31 +52,29 @@ void writeSharedBuf(char* out) {
   // pointer math beware!
   delta = sprintf(txtBuf + txtBufPos, out);
   txtBufPos += delta;
-  pthread_mutex_unlock(&lock);
+  piUnlock(TEXT_LOCK);
 }
 
 void flushBuf() {
-  pthread_mutex_lock(&lock);
+  piLock(TEXT_LOCK);
   if (txtBufPos > 0) {
     printf(txtBuf);
     txtBufPos = 0;
   }
-  pthread_mutex_unlock(&lock);
+  piUnlock(TEXT_LOCK);
 }
 
 void processNewDaikin() {
-  writeSharedBuf("startup step 1\n");
+  writeSharedBuf("\n--msg--\n");
+  reset();
   inSeq = 1;
 }
 
 void processDaikinConfirmation() {
-  writeSharedBuf("Confirmation\n");
-  reset();
-  // should be a two stage message so verify the first step happenned)
-  if (inSeq == 1) {
-    writeSharedBuf("Starting new message\n");
-    inSeq = 2;
-  }
+  //  writeSharedBuf("Confirmation\n");
+
+  // this is just verifying the start of a new frame which should already have come
+  // eventually we should verify this is sent after a new header
 }
 
 void processNewFrame() {
@@ -86,25 +88,76 @@ void processNewFrame() {
   frameNo++;
   framePos = 0;
   bufferPos = 0;
-  sprintf(msgBuf, "Starting frame %d\n", frameNo);
+  sprintf(msgBuf, "\n--frame %d--\n", frameNo);
   writeSharedBuf(msgBuf);
 }
 
+// writes the low byte of the int to the buffer
+// expects a buffer with at least 2 bytes
+void toHex(int val, char* buf) {
+  static int upperMask = 0xf0;
+  static int lowerMask = 0x0f;
+  int hi, lo;
+  hi = (val & upperMask) >> 4;
+  lo = (val & lowerMask);
+
+  // the comparison to 9 is to make get a-f instead of ; to ?
+  buf[0] = hi + '0';
+  if (hi > 9) {
+    buf[0] += 7;
+  }
+  buf[1] = lo + '0';
+  if (lo > 9) {
+    buf[1] += 7;
+  }
+}
+
+void advanceByte() {
+  framePos++;
+  if (frameNo < 2 && framePos >= 8) {
+    writeSharedBuf(" frame complete\n");
+    return;
+  }
+  if (frameNo == 2 && framePos >= 19) {
+    writeSharedBuf("\n\t--daikin--\n");
+    reset();
+    flushBuf();
+    return;
+  }
+}
+
 void printChar() {
-  writeSharedBuf("  ");
+
+  char buf[4];
+  int delta = 0;
+  int i;
+
+  if (bufferPos != 8) {
+    fprintf(stderr, "incomplete byte\n\n");
+  }
+
+  buf[2] = ' ';
+  buf[3] = 0;
+  for (i=7; i >= 0; i--) {
+    delta = delta << 1;
+    delta += bitBuffer[i];
+  }
+
+  toHex(delta, buf);
+  writeSharedBuf(buf);
+  advanceByte();  
   bufferPos = 0;
 }
 
 void processBit(char bit) {
-  pthread_mutex_lock(&bitlock);
-  writeSharedBuf(bit > 0 ? "1":"0");
-  //  printf("%d", bit);
+  piLock(BIT_BUF_LOCK);
+  //  writeSharedBuf(bit > 0 ? "1":"0");
   bitBuffer[bufferPos] = bit;
   bufferPos++;
   if (bufferPos == 8) {
     printChar();
   }
-  pthread_mutex_unlock(&bitlock);
+  piUnlock(BIT_BUF_LOCK);
 }
 
 void badData(uint32_t duration) {
@@ -121,9 +174,9 @@ void processHighTime(uint32_t duration) {
     processDaikinConfirmation();
   } else if(duration > 34000 && duration < 36000) {
     processNewFrame();
-  } else if(duration > 300 && duration < 450) {
+  } else if(duration > 200 && duration < 450) {
     processBit(0);
-  } else if(duration > 1150 && duration < 1300) {
+  } else if(duration > 1100 && duration < 1300) {
     processBit(1);
   } else {
     badData(duration);
@@ -177,16 +230,6 @@ int main(void) {
     return 1;
   }
 
-  if (pthread_mutex_init(&lock, NULL) != 0) {
-    printf("\n mutex init failed\n");
-    return 1;
-  }
-
-  if (pthread_mutex_init(&bitlock, NULL) != 0) {
-    printf("\n bit buffer mutex init failed\n");
-    return 1;
-  }
-  
   pinMode(BUTTON_PIN, INPUT);
   pullUpDnControl(BUTTON_PIN, PUD_UP);
   if (wiringPiISR(BUTTON_PIN, INT_EDGE_BOTH, &changeInt) < 0) {
